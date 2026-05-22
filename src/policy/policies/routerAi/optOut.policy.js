@@ -5,7 +5,7 @@
  *
  * Bloquea el routing si alguno de los destinos tiene opt-out activo.
  * Los destinos con opt-out van a blockedDestinations, no bloquean la
- * campana completa — a menos que TODOS los destinos esten en opt-out.
+ * campaña completa — a menos que TODOS los destinos esten en opt-out.
  *
  * Scope: router_ai.routing
  */
@@ -26,12 +26,12 @@ module.exports = function buildOptOutPolicy() {
 
       const activeDestinations = destinations.filter((d) => !d.optOut);
 
-      // Si TODOS los destinos estan en opt-out, bloquear la campana completa
+      // Si TODOS los destinos estan en opt-out, bloquear la campaña completa
       if (activeDestinations.length === 0) {
         return {
           allowed: false,
           code: 'OPT_OUT',
-          reason: 'Todos los destinos tienen opt-out activo. Campana bloqueada.',
+          reason: 'Todos los destinos tienen opt-out activo. Campaña bloqueada.',
           metadata: { optOutCount: optOutIds.length },
         };
       }

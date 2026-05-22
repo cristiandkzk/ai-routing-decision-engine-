@@ -20,12 +20,12 @@ module.exports = function buildRiskGatesPolicy() {
       const risk = ctx.risk || {};
       const opState = ctx.operationalState || {};
 
-      // Tenant/campana/numero pausado
+      // Tenant/campaña/numero pausado
       if (opState.companyPaused) {
         return {
           allowed: false,
           code: 'TENANT_PAUSED',
-          reason: 'El tenant esta pausado. No se pueden enviar campanas.',
+          reason: 'El tenant esta pausado. No se pueden enviar campañas.',
           metadata: {},
         };
       }

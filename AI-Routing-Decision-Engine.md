@@ -82,7 +82,7 @@ El Decision Engine debe ser canal-agnostico en su core.
 
 ```txt
 campaignRouting.service
-  -> detecta canal de la campana
+  -> detecta canal de la campaña
   -> instancia ChannelSnapshot adapter correcto
   -> construye snapshot universal (CampaignRoutingSnapshot)
   -> llama routingDecision.service
@@ -472,12 +472,12 @@ mandar message.text al modelo (prevencion de prompt injection)
 
 ## campaignRouting.service
 
-Adaptador especifico para campanas o acciones de marketing.
+Adaptador especifico para campañas o acciones de marketing.
 
 Responsabilidad:
 
 ```txt
-detectar canal de la campana
+detectar canal de la campaña
 instanciar el ChannelSnapshot adapter correcto
 construir CampaignRoutingSnapshot universal
 estimar costos
@@ -735,7 +735,7 @@ if (overrideARS != null && overrideARS > 0) return overrideARS;
 
 ### Por que usar una tarifa global como proxy
 
-Las campanas muchas veces no tienen `templateCategory` definida al
+Las campañas muchas veces no tienen `templateCategory` definida al
 momento de simular. La tarifa GLOBAL+marketing es conservadora: tiende
 a sobreestimar, lo que es preferible a subestimar y no bloquear envios
 sin saldo suficiente.
@@ -803,7 +803,7 @@ El motor reduce costo porque:
 no llama IA si una regla alcanza
 usa cache de decisiones
 elige modelo segun costo/riesgo
-hace una llamada por campana, no una por destino
+hace una llamada por campaña, no una por destino
 limita el snapshot enviado al modelo (sin message.text, sin secretos)
 registra tokens por tenant, feature, provider y modelo
 mide tokens evitados por reglas/cache/tools

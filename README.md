@@ -15,6 +15,18 @@ Este proyecto documenta un patron para plataformas que usan IA para decidir
 acciones con impacto real: envios, publicaciones, automatizaciones, respuestas,
 campañas, flujos operativos o consumo de APIs externas.
 
+## Inicio rapido
+
+No requiere base de datos ni API keys. Todo corre en memoria.
+
+```bash
+git clone https://github.com/cristiandkzk/AI-Routing-Decision-Engine.git
+cd AI-Routing-Decision-Engine
+npm install
+npm run simulate   # 12 casos de prueba con output en consola
+npm test           # 71 tests unitarios e integracion
+```
+
 ## Flujo principal
 
 ```mermaid
