@@ -555,6 +555,41 @@ porque el ruleOnlyFallback se activa cuando las reglas bloquean.
 El documento completo tiene la seccion "Bugs reales encontrados durante la implementacion"
 con los 5 errores que surgieron al correr tests y simulacion — no al leer el spec.
 
+## Observabilidad
+
+El orquestador debe emitir un evento observable en cada paso del flujo,
+independientemente del sistema de logging que use la plataforma.
+
+Puntos minimos a instrumentar:
+
+```txt
+inicio de decision      — clientId, mode, canal, cantidad de destinos
+politicas evaluadas     — allow/block + codigo de bloqueo si aplica
+cache hit/miss          — inputHash + contextHash
+proveedor elegido       — provider, model, tier
+llamada a la IA         — timestamp de inicio
+respuesta de la IA      — latencia, tokens entrada/salida, intentos
+validacion de schema    — valido/invalido + errores si aplica
+business validator      — passed/failed + motivos
+fallback activado       — razon (IA no disponible, schema invalido, etc.)
+resultado final         — decision, riskLevel, confidence, reasonCodes
+```
+
+Esto permite debuggear el flujo completo sin tocar el codigo de produccion.
+En desarrollo, estos eventos pueden escribirse a un archivo separado y
+observarse en tiempo real con `tail -f` o equivalente.
+
+En produccion, los mismos eventos alimentan metricas, alertas y dashboards:
+
+```txt
+tasa de cache hit por tenant
+tasa de fallback por provider
+distribucion de riskLevel por campania
+tokens consumidos por feature y modelo
+tiempo de respuesta de la IA por provider
+politicas que mas bloquean (ranking)
+```
+
 ## Documento completo
 
 La version extendida esta en:
