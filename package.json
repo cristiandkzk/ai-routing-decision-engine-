@@ -1,0 +1,23 @@
+{
+  "name": "ai-routing-decision-engine",
+  "version": "1.0.0",
+  "description": "Rule-first AI routing engine — protocol, implementation and runnable simulation.",
+  "license": "MIT",
+  "scripts": {
+    "simulate": "node scripts/simulate.js",
+    "test": "jest --no-coverage",
+    "test:unit": "jest tests/unit --no-coverage",
+    "test:integration": "jest tests/integration --no-coverage"
+  },
+  "dependencies": {
+    "nanoid": "^3.3.7"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "testMatch": ["**/tests/**/*.test.js"],
+    "testTimeout": 10000
+  }
+}
