@@ -50,7 +50,8 @@ Construir un motor de decisiones que:
 - use reglas deterministicas antes que IA;
 - permita aprobaciones humanas;
 - soporte fallback conservador;
-- pueda operar en modo simulacion antes de afectar produccion.
+- pueda operar en modo simulacion antes de afectar produccion;
+- soporte multiples canales sin cambiar el core.
 
 ## Principio
 
@@ -75,6 +76,43 @@ Nunca:
 AI Router -> Executor directo
 ```
 
+## Arquitectura multicanal
+
+El Decision Engine debe ser canal-agnostico en su core.
+
+```txt
+campaignRouting.service
+  -> detecta canal de la campana
+  -> instancia ChannelSnapshot adapter correcto
+  -> construye snapshot universal (CampaignRoutingSnapshot)
+  -> llama routingDecision.service
+
+routingDecision.service
+  -> siempre recibe el mismo contrato universal
+  -> no sabe ni le importa si el canal es Meta, Instagram, Telegram, etc.
+```
+
+Para agregar un canal nuevo:
+
+```txt
+agregar {Canal}ChannelSnapshot.js     <- traduce estado del canal al snapshot universal
+agregar {canal}CostEstimator.service  <- estima costo especifico del canal
+agregar {canal}Balance.service        <- reserva saldo si el canal lo requiere
+agregar politicas especificas del canal si las necesita
+```
+
+No cambiar:
+
+```txt
+routingDecision.service
+RouterDecision.model
+routerDecision.schema
+ruleOnlyFallback.service
+Policy Engine
+AI Decision Cache
+Provider Selector
+```
+
 ## Componentes
 
 ### 1. Rule Engine / Policy Engine
@@ -96,6 +134,19 @@ approval requerida y no aprobada -> block
 ```
 
 La IA no debe poder ignorar estas reglas.
+
+Las politicas deben agruparse por scope. Para routing se recomienda el scope
+`router_ai.routing` con este orden de evaluacion:
+
+```txt
+optOut
+campaignChannel
+channelConnected
+channelBalance
+planLimits
+riskGates
+{canal}Experimental (si el canal tiene restricciones adicionales)
+```
 
 ### 2. AI Router
 
@@ -136,6 +187,7 @@ si el schema falla:
   no ejecutar
   reintentar como maximo una vez
   si vuelve a fallar, usar fallback conservador
+  registrar evento schema_failed
 ```
 
 ### 4. Business Validator
@@ -202,17 +254,30 @@ src/
       routingDecision.service
       ruleOnlyFallback.service
       businessValidator.service
-      inputSnapshot.service
-  campaigns/
-    services/
-      campaignRouting.service
+  routing/
+    campaignRouting.service          <- orquestador, canal-agnostico
+    CampaignRoutingSnapshot          <- builder del snapshot universal
+    adapters/
+      MetaChannelSnapshot            <- canal Meta
+      InstagramChannelSnapshot       <- futuro
+      MercadoLibreChannelSnapshot    <- futuro
+      TelegramChannelSnapshot        <- futuro
   policy/
     policy.engine
+    policies/
+      routerAi/
+        optOut.policy
+        campaignChannel.policy
+        channelConnected.policy
+        channelBalance.policy
+        planLimits.policy
+        riskGates.policy
+        experimentalChannel.policy   <- para canales experimentales
   approvals/
     approval.service
   costs/
-    costEstimator.service
-    balanceReservation.service
+    {canal}CostEstimator.service
+    {canal}Balance.service
   ai/
     providerSelector.service
     decisionCache.service
@@ -228,7 +293,7 @@ Responsabilidad:
 guardar decision
 guardar inputHash/contextHash
 guardar output validado
-guardar costo estimado
+guardar costo estimado (IA y canal externo)
 guardar riesgo
 guardar estado
 guardar expiracion
@@ -246,6 +311,7 @@ decisionId
 mode
 state
 decision
+channel
 riskLevel
 inputHash
 contextHash
@@ -256,19 +322,20 @@ provider
 model
 tokensInput
 tokensOutput
-estimatedAiCost
-estimatedExternalApiCost
+estimatedAiCostUSD
+estimatedCostARS
 requiresApproval
 approvalRequestId
 expiresAt
 summary
+confidence
 reasonCodes
 rulesApplied
 batches
 perDestinationDecisions
 blockedDestinations
 requiredActions
-costReservation
+balanceReservation
 cacheHit
 fallbackUsed
 rawOutput
@@ -280,6 +347,9 @@ idempotencyKey
 createdAt
 updatedAt
 ```
+
+`estimatedCostARS` es el campo universal de costo externo. Cada canal calcula
+el suyo y lo normaliza a esta unidad antes de guardarlo.
 
 Estados sugeridos:
 
@@ -298,6 +368,22 @@ blocked
 expired
 failed
 cancelled
+```
+
+Transiciones clave:
+
+```txt
+requested -> rule_checked
+rule_checked -> ai_requested si la IA aporta valor
+rule_checked -> business_validated si reglas alcanzan
+ai_requested -> ai_decided
+ai_decided -> schema_validated
+schema_validated -> business_validated
+business_validated -> approval_pending si requiere aprobacion
+business_validated -> routable si puede ejecutarse
+business_validated -> blocked si falla una regla dura
+approval_pending -> approved
+approved -> routable
 ```
 
 ## routingDecision.service
@@ -327,11 +413,10 @@ Flujo:
 Pseudocodigo:
 
 ```js
-async function decide(input) {
-  const snapshot = buildSafeSnapshot(input);
+async function decide(snapshot, opts) {
   const hashes = hashSnapshot(snapshot);
 
-  const policy = await policyEngine.evaluate(input.scope, snapshot);
+  const policy = await policyEngine.evaluate('router_ai.routing', snapshot);
   if (!policy.allowed) {
     return persist(ruleOnlyBlocked({ snapshot, policy, hashes }));
   }
@@ -342,8 +427,8 @@ async function decide(input) {
   }
 
   const provider = await providerSelector.select({
-    feature: input.feature,
-    riskLevel: snapshot.riskLevel,
+    feature: 'router_ai',
+    riskLevel: snapshot.risk.riskLevel,
     estimatedTokensInput: snapshot.estimatedTokensInput,
     estimatedTokensOutput: snapshot.estimatedTokensOutput,
   });
@@ -360,7 +445,11 @@ async function decide(input) {
   }
 
   const parsed = validateRouterDecisionSchema(raw);
-  const finalDecision = await businessValidator.validate(parsed, snapshot);
+  if (!parsed.valid) {
+    return persist(ruleOnlyFallback(snapshot, { reason: 'SCHEMA_INVALID' }));
+  }
+
+  const finalDecision = await businessValidator.validate(parsed.normalized, snapshot);
 
   await usageLedger.record(raw.usage);
   await decisionCache.storeIfSafe(finalDecision, hashes);
@@ -369,92 +458,139 @@ async function decide(input) {
 }
 ```
 
+El servicio no sabe que canal es. Recibe snapshot, produce decision.
+
+No debe:
+
+```txt
+ejecutar envios
+reservar saldo directamente
+ignorar policies
+aceptar output IA sin schema validator
+mandar message.text al modelo (prevencion de prompt injection)
+```
+
 ## campaignRouting.service
 
-Adaptador especifico para campañas o acciones de marketing.
+Adaptador especifico para campanas o acciones de marketing.
 
 Responsabilidad:
 
 ```txt
-recibir Campaign
-armar snapshot resumido
+detectar canal de la campana
+instanciar el ChannelSnapshot adapter correcto
+construir CampaignRoutingSnapshot universal
 estimar costos
-pedir decision al routingDecision.service
+llamar routingDecision.service
 devolver resultado para UI/API
 ```
 
-Snapshot recomendado:
+Snapshot universal recomendado (CampaignRoutingSnapshot):
 
 ```txt
 campaignId
-objective
-channels
-messageFingerprint
-hasLink
-mediaCount
-destinationsSummary
-outlierDestinations
-scheduleAt
+correlationId / causationId
+schemaVersion
+mode
 plan
-limits
-externalApiCostEstimate
-balanceSnapshot
+campaignType
+campaign               <- state, requiresBalanceReservation, safeHoursRequired
+message                <- fingerprint, hasLink, mediaCount (sin text crudo)
+destinations[]         <- resumen: id, type, riskScore, optOut, pauseState
+channel                <- objeto universal (ver abajo)
+limits                 <- normalizados del plan
+risk                   <- healthScore, warmupStage, linkReputation, safeHours
 featureFlags
-policySnapshot
-approvalSnapshot
-providerHealthSnapshot
+operationalState       <- pauses, circuitBreakers, locks
 ```
+
+Objeto `channel` universal:
+
+```txt
+channelType            <- "meta" | "instagram" | "mercadolibre" | "telegram" | "baileys"
+channelStatus          <- "connected" | "disconnected" | "degraded"
+channelVerified        <- boolean
+estimatedCostARS       <- normalizado (cada canal calcula el suyo)
+costCurrency           <- "ARS" | "USD"
+supportsGroups         <- boolean
+supportsBroadcast      <- boolean
+supportsTemplates      <- boolean
+supportsMedia          <- boolean
+rateLimitRemaining     <- number, normalizado
+qualityScore           <- 0-100, normalizado
+channelMeta            <- datos especificos del canal (no campos de negocio generales)
+```
+
+Cada `ChannelSnapshot` adapter traduce el estado del canal a este contrato.
+El `routingDecision.service` siempre recibe el mismo objeto.
 
 Primer endpoint recomendado:
 
 ```txt
 POST /api/campaigns/:id/routing/simulate
+POST /api/campaigns/:id/routing/advisory
+GET  /api/campaigns/:id/routing/decision/:decisionId
 ```
 
-Respuesta:
+Respuesta para UI:
 
 ```txt
+decisionId
+state
+mode
+channel
 decision
 riskLevel
-estimatedAiCost
-estimatedExternalApiCost
+estimatedCostARS
+estimatedAiCostUSD
 requiresApproval
 summary
+confidence
 reasonCodes
+rulesApplied
 batches
+perDestinationDecisions
 blockedDestinations
 requiredActions
+balanceReservation
+cacheHit
+fallbackUsed
 expiresAt
+createdAt
 ```
 
 ## routerDecision.schema
 
-Salida minima esperada:
+Salida minima esperada del modelo:
 
 ```json
 {
   "decisionId": "rdec_123",
-  "schemaVersion": "router_decision_output_v1",
+  "schemaVersion": "router_ai_output_v1",
   "decision": "allow",
   "riskLevel": "medium",
-  "estimatedExternalApiCost": 0,
-  "estimatedAiCost": 0.002,
+  "estimatedCostARS": 0,
+  "estimatedAiCostUSD": 0.002,
   "requiresApproval": false,
   "expiresAt": "2026-01-01T12:00:00.000Z",
   "summary": "Allowed with conservative batches.",
+  "confidence": "medium",
   "reasonCodes": ["RULES_PASSED"],
   "batches": [],
   "perDestinationDecisions": [],
   "blockedDestinations": [],
   "requiredActions": [],
-  "costReservation": {
+  "balanceReservation": {
     "required": false,
-    "estimatedAmount": 0
+    "estimatedAmountARS": 0
   },
-  "rulesApplied": ["policy_passed"],
-  "confidence": "medium"
+  "rulesApplied": ["policy_passed"]
 }
 ```
+
+`estimatedCostARS` reemplaza cualquier campo de costo especifico por canal
+(`estimatedMetaCost`, `estimatedApiCost`, etc.). El adapter de cada canal
+calcula el costo en su moneda y lo normaliza antes de pasarlo al schema.
 
 Enums recomendados:
 
@@ -503,6 +639,70 @@ MEDIUM_RISK_APPROVAL_REQUIRED
 HIGH_RISK_BLOCKED
 ```
 
+## Canales experimentales o no oficiales
+
+Si la plataforma soporta canales experimentales, no oficiales o de riesgo
+especial, el Decision Engine debe tratarlos como excepcion controlada.
+
+Reglas:
+
+```txt
+experimentalChannelEnabled debe ser true
+tenant debe tener habilitacion admin/root
+tenant debe aceptar terminos especificos
+si los terminos vencen o cambian, bloquear
+no usar canal experimental como fallback automatico
+no usar canal experimental solo para evitar costo de un canal oficial
+no permitir modo enforced hasta que exista una decision explicita de producto
+```
+
+En canales experimentales el motor solo deberia:
+
+```txt
+explicar riesgo
+sugerir accion manual
+pedir aprobacion
+funcionar en advisory o shadow
+bloquear si faltan flags o terminos
+```
+
+Implementar como politica dedicada:
+
+```txt
+{canal}Experimental.policy
+  -> verifica flags de habilitacion
+  -> verifica terminos aceptados y vigencia
+  -> bloquea modo enforced
+  -> bloquea uso como fallback de canal oficial
+```
+
+## Seleccion de modelo por plan
+
+El provider selector elige el modelo segun costo, riesgo y plan del tenant.
+
+```txt
+plan Base:
+  modelo cheap o balanced para decisiones simples y riesgo bajo/medio
+  ejemplo: Groq openai/gpt-oss-20b
+
+plan Pro/Premium:
+  modelo best para riesgo complejo y alto volumen
+  ejemplo: Groq openai/gpt-oss-120b
+
+fallback universal:
+  OpenRouter con modelo compatible con structured outputs
+  activar cuando el primario falla o el circuito esta abierto
+```
+
+Reglas para el provider selector:
+
+```txt
+no llamar IA si una regla alcanza
+no usar modelos sin structured outputs para decisiones criticas
+registrar el modelo real usado en RouterDecision
+elegir el modelo suficiente mas barato, no siempre el mejor
+```
+
 ## Reduccion de costo IA
 
 El motor reduce costo porque:
@@ -511,8 +711,8 @@ El motor reduce costo porque:
 no llama IA si una regla alcanza
 usa cache de decisiones
 elige modelo segun costo/riesgo
-hace una llamada por campaña, no una por destino
-limita el snapshot enviado al modelo
+hace una llamada por campana, no una por destino
+limita el snapshot enviado al modelo (sin message.text, sin secretos)
 registra tokens por tenant, feature, provider y modelo
 mide tokens evitados por reglas/cache/tools
 ```
@@ -547,40 +747,16 @@ detecta acciones duplicadas con idempotencia
 Metricas utiles:
 
 ```txt
-external_api_cost_estimated_total
-external_api_cost_reserved_total
-external_api_cost_confirmed_total
-external_api_balance_insufficient_total
-external_api_reservation_failed_total
-decisions_blocked_by_cost_total
+external_api_cost_estimated_total{channel}
+external_api_cost_reserved_total{channel}
+external_api_cost_confirmed_total{channel}
+external_api_balance_insufficient_total{channel}
+external_api_reservation_failed_total{channel}
+decisions_blocked_by_cost_total{channel}
 ```
 
-## Canales experimentales o no oficiales
-
-Si la plataforma soporta canales experimentales, no oficiales o de riesgo
-especial, el Decision Engine debe tratarlos como excepcion controlada.
-
-Reglas:
-
-```txt
-experimentalChannelEnabled debe ser true
-tenant debe tener habilitacion admin/root
-tenant debe aceptar terminos especificos
-si los terminos vencen o cambian, bloquear
-no usar canal experimental como fallback automatico
-no usar canal experimental solo para evitar costo de un canal oficial
-no permitir modo enforced hasta que exista una decision explicita de producto
-```
-
-En canales experimentales el motor solo deberia:
-
-```txt
-explicar riesgo
-sugerir accion manual
-pedir aprobacion
-funcionar en advisory o shadow
-bloquear si faltan flags o terminos
-```
+El label `{channel}` permite comparar el impacto por canal cuando se agreguen
+nuevos canales.
 
 ## Modos de rollout
 
@@ -611,7 +787,7 @@ no afecta produccion
 ### enforced
 
 ```txt
-solo para canales estables
+solo para canales estables y oficiales
 requiere schema validator
 requiere business validator
 requiere idempotencia
@@ -619,14 +795,18 @@ requiere costo reservado si aplica
 requiere decision vigente
 ```
 
+Regla:
+
+```txt
+Los canales experimentales no deben arrancar en enforced.
+Para canales experimentales: advisory/shadow o bloquear salvo habilitacion explicita.
+```
+
 ## Eventos recomendados
 
 ```txt
-routing.requested
-routing.decided
-routing.blocked
-router_ai.requested
 router_ai.decided
+router_ai.blocked
 router_ai.schema_failed
 router_ai.business_validation_failed
 router_ai.fallback_used
@@ -639,6 +819,94 @@ ai.tokens.used
 ai.tokens.avoided
 ```
 
+Reglas de eventos:
+
+```txt
+cada decision debe tener decisionId unico
+cada evento debe llevar clientId, correlationId, causationId
+cada handler debe ser idempotente
+si el schema falla, emitir router_ai.schema_failed
+si usa fallback, emitir router_ai.fallback_used
+si requiere aprobacion, emitir approval.requested
+```
+
+Los eventos deben pasar por EventOutbox y guardarse atomicamente con
+RouterDecision para garantizar consistencia en reintentos.
+
+## Feature flags recomendadas
+
+```txt
+routerAiEnabled
+routerAiForCampaignsEnabled
+routerAiForMetaEnabled
+routerAiForInstagramEnabled      <- futuro
+routerAiForMercadoLibreEnabled   <- futuro
+routerAiForTelegramEnabled       <- futuro
+routerAiForBaileysEnabled        <- siempre advisory/shadow, nunca enforced
+tenantRouterAiEnabled
+forceRuleOnlyForTenant
+```
+
+Comportamiento por flag:
+
+```txt
+routerAiEnabled=false:
+  usar Rule Engine sin IA
+
+routerAiMode=shadow:
+  ejecutar decision real por reglas
+  guardar decision IA solo para comparacion
+
+routerAiMode=advisory:
+  mostrar recomendacion IA
+  requerir confirmacion humana
+
+routerAiMode=enforced:
+  permitir que la decision IA validada afecte routing
+  solo en canales estables
+```
+
+## Observabilidad
+
+Metricas:
+
+```txt
+ai_router_requests_total{channel}
+ai_router_cache_hits_total{channel}
+ai_router_success_total{channel}
+ai_router_schema_failures_total
+ai_router_business_validation_failures_total{channel}
+ai_router_fallback_total
+ai_router_latency_ms
+ai_router_cost_usd
+ai_router_tokens_input_total
+ai_router_tokens_output_total
+campaigns_blocked_by_ai{channel}
+campaigns_required_approval{channel}
+router_ai_shadow_disagreements_total
+router_ai_decision_expired_total
+router_ai_rule_only_fallback_total
+router_ai_dlq_count
+router_ai_provider_circuit_open_total
+router_ai_balance_reservation_failures_total{channel}
+router_ai_business_validator_overrides_total
+```
+
+El label `{channel}` es la forma de comparar canales sin cambiar el core del motor.
+
+Alertas recomendadas:
+
+```txt
+schema failure > 2%
+fallback > 5%
+latency p95 alta
+costo IA mensual alto
+cache hit rate bajo
+shadow mode muestra alto desacuerdo
+decisiones expiran antes de ejecutar
+fallan reservas de saldo
+```
+
 ## Checklist de implementacion
 
 Primer corte:
@@ -648,19 +916,21 @@ Primer corte:
 - Crear `ruleOnlyFallback.service`.
 - Crear `routingDecision.service`.
 - Crear adaptador por dominio, por ejemplo `campaignRouting.service`.
-- Integrar Policy Engine.
+- Crear `CampaignRoutingSnapshot` con contrato universal.
+- Crear primer `ChannelSnapshot` adapter para el canal oficial.
+- Integrar Policy Engine con scope `router_ai.routing`.
 - Integrar decision cache.
-- Integrar provider selector.
+- Integrar provider selector con seleccion por plan.
 - Integrar usage ledger.
-- Integrar cost estimator.
+- Integrar cost estimator del canal.
 - Integrar approvals.
 - Exponer endpoint de simulacion.
 - Mostrar decision en UI.
 
 Segundo corte:
 
-- Agregar EventOutbox.
-- Agregar metricas.
+- Agregar EventOutbox atomico con RouterDecision.
+- Agregar metricas con label `{channel}`.
 - Agregar dashboard de decisiones.
 - Agregar shadow mode.
 - Agregar alertas de costo.
@@ -671,6 +941,7 @@ Tercer corte:
 - Activar advisory para tenants beta.
 - Activar enforced solo en canales oficiales o estables.
 - Mantener canales experimentales en advisory/shadow.
+- Agregar nuevos `ChannelSnapshot` adapters para canales adicionales.
 
 ## Conclusiones
 
@@ -684,7 +955,8 @@ Beneficios:
 - decisiones auditables;
 - rollback mas simple;
 - mejor explicacion para el usuario;
-- base solida para aprobaciones y compliance.
+- base solida para aprobaciones y compliance;
+- nuevos canales sin tocar el core.
 
 Regla final:
 

@@ -15,6 +15,80 @@ Este proyecto documenta un patron para plataformas que usan IA para decidir
 acciones con impacto real: envios, publicaciones, automatizaciones, respuestas,
 campañas, flujos operativos o consumo de APIs externas.
 
+## Flujo principal
+
+```mermaid
+flowchart TD
+    A([Accion solicitada]) --> B[Policy Engine\nReglas duras]
+
+    B -->|blocked| Z1([block])
+    B -->|allowed| C{Decision Cache}
+
+    C -->|hit| D[Validar cache\ny persistir]
+    D --> OUT
+
+    C -->|miss| E[Provider Selector\nelige modelo segun\ncosto y riesgo]
+
+    E -->|sin provider| F([ruleOnlyFallback])
+    E -->|provider ok| G[AI Router\nllama al modelo]
+
+    G -->|error / timeout| F
+    F --> OUT
+
+    G -->|respuesta| H[Schema Validator\nJSON estricto]
+
+    H -->|invalido - retry| G
+    H -->|invalido x2| F
+    H -->|valido| I[Business Validator\nre-valida todo]
+
+    I -->|falla regla dura| Z2([block])
+    I -->|aprobacion requerida| J[Approval Workflow]
+    I -->|ok| K[RouterDecision\nroutable]
+
+    J -->|aprobado| K
+    J -->|rechazado| Z3([block])
+
+    K --> L[EventOutbox\nauditoria atomica]
+    L --> OUT([Executor\nsolo corre decisiones validadas])
+
+    style Z1 fill:#ef4444,color:#fff
+    style Z2 fill:#ef4444,color:#fff
+    style Z3 fill:#ef4444,color:#fff
+    style F fill:#f97316,color:#fff
+    style OUT fill:#22c55e,color:#fff
+    style K fill:#22c55e,color:#fff
+```
+
+## Arquitectura multicanal
+
+```mermaid
+flowchart LR
+    SVC[campaignRouting.service\norquestador] --> SNAP[CampaignRoutingSnapshot\ncontrato universal]
+
+    subgraph Adapters
+        A1[MetaChannelSnapshot]
+        A2[InstagramChannelSnapshot]
+        A3[MercadoLibreChannelSnapshot]
+        A4[TelegramChannelSnapshot]
+    end
+
+    SVC --> A1
+    SVC --> A2
+    SVC --> A3
+    SVC --> A4
+
+    A1 & A2 & A3 & A4 --> SNAP
+
+    SNAP --> CORE[routingDecision.service\ncanal-agnostico]
+
+    CORE --> RD[(RouterDecision)]
+
+    style CORE fill:#6366f1,color:#fff
+    style SNAP fill:#0ea5e9,color:#fff
+```
+
+> Para agregar un canal nuevo: crear el adapter correspondiente. El core no cambia.
+
 ## Por que existe
 
 Muchos sistemas conectan la IA directamente con la ejecucion:
@@ -196,17 +270,29 @@ src/
       routingDecision.service
       ruleOnlyFallback.service
       businessValidator.service
-      inputSnapshot.service
-  campaigns/
-    services/
-      campaignRouting.service
+  routing/
+    campaignRouting.service          <- orquestador, canal-agnostico
+    CampaignRoutingSnapshot          <- contrato universal
+    adapters/
+      MetaChannelSnapshot            <- primer canal oficial
+      InstagramChannelSnapshot       <- futuro
+      MercadoLibreChannelSnapshot    <- futuro
+      TelegramChannelSnapshot        <- futuro
   policy/
     policy.engine
+    policies/
+      routerAi/
+        optOut.policy
+        channelConnected.policy
+        channelBalance.policy
+        planLimits.policy
+        riskGates.policy
+        experimentalChannel.policy
   approvals/
     approval.service
   costs/
-    costEstimator.service
-    balanceReservation.service
+    {canal}CostEstimator.service
+    {canal}Balance.service
   ai/
     providerSelector.service
     decisionCache.service
@@ -239,8 +325,8 @@ provider
 model
 tokensInput
 tokensOutput
-estimatedAiCost
-estimatedExternalApiCost
+estimatedAiCostUSD
+estimatedCostARS
 requiresApproval
 approvalRequestId
 expiresAt
@@ -348,7 +434,9 @@ Primer corte:
 - Crear `ruleOnlyFallback.service`.
 - Crear `routingDecision.service`.
 - Crear adaptador por dominio, por ejemplo `campaignRouting.service`.
-- Integrar Policy Engine.
+- Crear `CampaignRoutingSnapshot` con contrato universal.
+- Crear primer `ChannelSnapshot` adapter para el canal oficial.
+- Integrar Policy Engine con scope dedicado para routing.
 - Integrar Decision Cache.
 - Integrar Provider Selector.
 - Integrar Usage Ledger.
@@ -371,6 +459,7 @@ Tercer corte:
 - Activar advisory para tenants beta.
 - Activar enforced solo en canales oficiales o estables.
 - Mantener canales experimentales en advisory/shadow.
+- Agregar nuevos `ChannelSnapshot` adapters para canales adicionales.
 
 ## Documento completo
 
