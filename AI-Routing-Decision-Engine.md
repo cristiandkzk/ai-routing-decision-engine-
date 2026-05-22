@@ -371,7 +371,7 @@ async function decide(input) {
 
 ## campaignRouting.service
 
-Adaptador especifico para campanias o acciones de marketing.
+Adaptador especifico para campañas o acciones de marketing.
 
 Responsabilidad:
 
@@ -511,7 +511,7 @@ El motor reduce costo porque:
 no llama IA si una regla alcanza
 usa cache de decisiones
 elige modelo segun costo/riesgo
-hace una llamada por campania, no una por destino
+hace una llamada por campaña, no una por destino
 limita el snapshot enviado al modelo
 registra tokens por tenant, feature, provider y modelo
 mide tokens evitados por reglas/cache/tools

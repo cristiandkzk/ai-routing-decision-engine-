@@ -13,7 +13,7 @@ El executor solo ejecuta decisiones validadas.
 
 Este proyecto documenta un patron para plataformas que usan IA para decidir
 acciones con impacto real: envios, publicaciones, automatizaciones, respuestas,
-campanias, flujos operativos o consumo de APIs externas.
+campañas, flujos operativos o consumo de APIs externas.
 
 ## Por que existe
 
