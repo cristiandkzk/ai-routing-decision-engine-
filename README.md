@@ -425,30 +425,56 @@ Compara la decision real contra la decision IA sin afectar produccion.
 Solo para canales estables. Requiere schema validator, business validator,
 idempotencia, decision vigente y reserva de costo si aplica.
 
+## Estructuras necesarias
+
+Antes de implementar el motor estas estructuras deben existir:
+
+**Modelos / schemas**
+- `RouterDecision` — persistencia de cada decision con su state machine.
+- `EventOutbox` — cola de eventos atomica con RouterDecision.
+- `ApprovalRequest` — solicitudes de aprobacion humana.
+- `RouterDecision.schema` — JSON Schema estricto del output de IA.
+
+**Servicios de infraestructura**
+- Policy Engine con soporte de scopes.
+- AI Decision Cache con key por inputHash + contextHash.
+- Provider Selector con seleccion por plan y riskLevel.
+- AI Circuit Breaker por provider/model.
+- AI Usage Ledger con tokens reales.
+- `{canal}CostEstimator` — retorna `0` si falla, nunca rompe el flujo.
+- `{canal}BalanceService` — reserva saldo antes de ejecutar en enforced.
+- Rate Card / Pricing Store con vigencia temporal.
+- Exchange Rate Service con cache y fallback de `.env`.
+
+**Servicios de negocio**
+- ApprovalService — el motor la llama, no la implementa.
+
+Ver la seccion "Estructuras necesarias para implementar" en el
+[documento completo](./AI-Routing-Decision-Engine.md) para el orden
+de construccion recomendado y lo que puede dejarse para despues.
+
 ## Checklist de implementacion
 
-Primer corte:
+Primer corte (en este orden):
 
-- Crear `RouterDecision.model`.
-- Crear `routerDecision.schema`.
-- Crear `ruleOnlyFallback.service`.
-- Crear `routingDecision.service`.
-- Crear adaptador por dominio, por ejemplo `campaignRouting.service`.
+- Crear `RouterDecision.model` y `routerDecision.schema`.
+- Crear `ruleOnlyFallback.service` — el motor necesita operar sin IA desde el dia uno.
+- Integrar Policy Engine con las politicas minimas del canal.
+- Crear `routingDecision.service` (orquestador).
 - Crear `CampaignRoutingSnapshot` con contrato universal.
 - Crear primer `ChannelSnapshot` adapter para el canal oficial.
-- Integrar Policy Engine con scope dedicado para routing.
-- Integrar Decision Cache.
-- Integrar Provider Selector.
-- Integrar Usage Ledger.
-- Integrar Cost Estimator.
-- Integrar Approvals.
+- Crear adaptador por dominio, por ejemplo `campaignRouting.service`.
+- Integrar Cost Estimator del canal (con fallback a `0` si falla — nunca romper el flujo).
 - Exponer endpoint de simulacion.
-- Mostrar decision en UI.
+- Verificar los casos minimos de test antes de pasar al siguiente corte.
 
 Segundo corte:
 
-- Agregar EventOutbox.
-- Agregar metricas.
+- Agregar EventOutbox atomico con RouterDecision.
+- Integrar Decision Cache + Provider Selector.
+- Integrar Usage Ledger con tokens reales.
+- Integrar Approvals.
+- Agregar metricas con label `{channel}`.
 - Agregar dashboard de decisiones.
 - Agregar shadow mode.
 - Agregar alertas de costo.

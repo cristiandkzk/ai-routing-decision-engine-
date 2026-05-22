@@ -676,6 +676,94 @@ Implementar como politica dedicada:
   -> bloquea uso como fallback de canal oficial
 ```
 
+## Estimacion de costo del canal
+
+El campo `estimatedCostARS` del snapshot universal no es un dato que la IA
+calcula — es un dato que la plataforma calcula antes de llamar a la IA.
+La IA lo recibe como contexto para tomar mejores decisiones.
+
+### Donde se calcula
+
+En el adaptador de dominio (`campaignRouting.service`), dentro de
+`_buildChannelSnapshot`, antes de construir el snapshot universal.
+El `routingDecision.service` recibe el costo ya calculado — no lo
+vuelve a calcular.
+
+### Como se calcula
+
+Cada canal tiene su propio estimador:
+
+```txt
+{canal}CostEstimator.service
+  -> consulta rate card vigente del canal
+  -> aplica markup del proveedor si aplica
+  -> filtra destinatarios con opt-out o pausados (no cuentan)
+  -> calcula costo total en la moneda del canal (USD, EUR, etc.)
+  -> convierte a moneda local usando tipo de cambio cacheado
+  -> retorna estimatedCostARS (o el equivalente local)
+```
+
+### Logica de fallback del estimador
+
+El estimador nunca debe romper el flujo de routing.
+
+```txt
+si rate card no existe para el pais del destinatario:
+  usar tarifa GLOBAL como proxy conservador
+
+si falla la conversion a moneda local:
+  usar tasa de fallback del .env
+
+si el estimador falla completamente:
+  loguear warning
+  retornar 0
+  el costo real se confirma al reservar saldo antes de ejecutar
+```
+
+Si el estimador retorna `0`, la policy de balance no bloquea — la IA
+recibe costo `0` y el costo real queda diferido a la reserva de saldo.
+
+### Si el caller ya trae el costo calculado
+
+Si el request ya incluye `estimatedCostARS > 0` (calculado por la UI
+antes de llamar al endpoint), el adaptador lo usa directo sin consultar
+la rate card:
+
+```txt
+if (overrideARS != null && overrideARS > 0) return overrideARS;
+```
+
+### Por que usar una tarifa global como proxy
+
+Las campanas muchas veces no tienen `templateCategory` definida al
+momento de simular. La tarifa GLOBAL+marketing es conservadora: tiende
+a sobreestimar, lo que es preferible a subestimar y no bloquear envios
+sin saldo suficiente.
+
+### Tipo de cambio
+
+Si el canal cobra en USD y la plataforma trabaja en moneda local:
+
+```txt
+cachear el tipo de cambio (recomendado: 30 minutos)
+si la fuente externa falla, usar fallback del .env
+nunca bloquear el flujo de routing por una falla del tipo de cambio
+```
+
+### Resumen del flujo
+
+```txt
+targets (filtrados: sin opt-out ni pausados)
+  -> rate card del canal (por pais o GLOBAL)
+  -> unitCost = precio * (1 + markupPct / 100)
+  -> totalUSD = unitCost * recipientCount
+  -> arsRate = getExchangeRate() con fallback a .env
+  -> estimatedCostARS = ceil(totalUSD * arsRate)
+  -> ChannelSnapshot.build({ estimatedCostARS, ... })
+  -> CampaignRoutingSnapshot.channel.estimatedCostARS
+  -> routingDecision.service lo pasa a la IA y al Business Validator
+```
+
 ## Seleccion de modelo por plan
 
 El provider selector elige el modelo segun costo, riesgo y plan del tenant.
@@ -907,6 +995,134 @@ decisiones expiran antes de ejecutar
 fallan reservas de saldo
 ```
 
+## Estructuras necesarias para implementar
+
+Antes de escribir la primera linea del motor, estas estructuras deben existir
+o construirse. El motor las consume — no las reemplaza.
+
+### Estructuras de datos (modelos / schemas)
+
+```txt
+RouterDecision
+  la decision en si misma, con su state machine.
+  sin esto no hay auditoria ni idempotencia.
+
+EventOutbox
+  cola de eventos para publicar de forma atomica con RouterDecision.
+  sin esto los eventos pueden perderse en un crash entre la decision y
+  la publicacion.
+
+ApprovalRequest
+  solicitud de aprobacion humana generada cuando requiresApproval = true.
+  sin esto el flujo de advisory no tiene donde persistir la aprobacion.
+
+CampaignRoutingSnapshot (o equivalente por dominio)
+  el contrato de entrada al motor. define exactamente que datos recibe la IA.
+  sin un contrato fijo, el motor no es canal-agnostico.
+
+RouterDecision.schema (JSON Schema del output de IA)
+  define exactamente que debe devolver el modelo.
+  sin esto no hay forma de validar ni rechazar output invalido.
+```
+
+### Servicios de infraestructura
+
+```txt
+Policy Engine
+  evalua reglas duras antes de llamar a la IA.
+  debe soportar scopes (ej: 'router_ai.routing') para agrupar politicas.
+  sin esto la IA puede recibir requests que las reglas deberian bloquear.
+
+AI Decision Cache
+  evita llamar a la IA cuando el input y el contexto no cambiaron.
+  key: hash(inputSnapshot) + hash(contextSnapshot).
+  sin esto cada request gasta tokens aunque la decision sea identica.
+
+Provider Selector
+  elige (provider, model) segun feature, riskLevel y plan del tenant.
+  debe soportar circuit breaker por provider.
+  sin esto se usa siempre el mismo modelo sin importar costo o riesgo.
+
+AI Circuit Breaker
+  abre el circuito cuando un provider falla repetidamente.
+  sin esto una caida de Groq puede generar miles de timeouts en cascada.
+
+AI Usage Ledger
+  registra tokens reales (input + output) por tenant, feature y modelo.
+  sin esto no hay forma de medir costo real ni detectar abuso.
+
+{canal}CostEstimator
+  estima costo del canal antes de construir el snapshot.
+  un estimador por canal. retorna 0 si falla — nunca rompe el flujo.
+  sin esto la IA recibe estimatedCostARS = 0 siempre.
+
+{canal}BalanceService
+  reserva saldo antes de ejecutar en modo enforced.
+  sin esto se pueden ejecutar envios sin saldo disponible.
+```
+
+### Servicios de negocio
+
+```txt
+ApprovalService
+  crea y gestiona ApprovalRequest cuando requiresApproval = true.
+  el motor la llama — no la implementa.
+
+Rate Card / Pricing Store
+  almacena precios por canal, pais y categoria.
+  el estimador la consulta. debe soportar vigencia temporal (effectiveFrom/To).
+
+Exchange Rate Service
+  convierte costo del canal (USD, EUR, etc.) a moneda local.
+  debe tener cache (recomendado: 30 minutos) y fallback de .env.
+  sin esto la conversion falla si la API externa no responde.
+```
+
+### Lo que el motor NO necesita que exista antes
+
+```txt
+el executor de envios
+  el motor solo produce decisiones. el executor puede implementarse despues.
+
+el dashboard de decisiones
+  util pero no bloqueante. las decisiones ya quedan en RouterDecision.
+
+el shadow mode completo
+  se puede activar despues de validar simulation y advisory.
+
+multiples ChannelSnapshot adapters
+  solo se necesita el del canal oficial para el primer corte.
+```
+
+### Orden de construccion recomendado
+
+```txt
+1. RouterDecision.model + routerDecision.schema
+   sin persistencia no hay nada que auditar.
+
+2. ruleOnlyFallback.service
+   el motor necesita poder operar sin IA desde el primer dia.
+
+3. Policy Engine con las politicas minimas del canal
+   las reglas duras deben existir antes que la IA.
+
+4. routingDecision.service (orquestador)
+   integra todo lo anterior.
+
+5. ChannelSnapshot adapter del canal oficial
+   traduce el estado del canal al contrato universal.
+
+6. campaignRouting.service (o equivalente por dominio)
+   conecta el dominio con el motor.
+
+7. Endpoint de simulacion
+   primer punto de entrada para validar el flujo completo.
+
+8. AI Decision Cache + Provider Selector
+   optimizacion de costo — pueden agregarse en el segundo corte
+   si el primer corte ya funciona correctamente.
+```
+
 ## Checklist de implementacion
 
 Primer corte:
@@ -942,6 +1158,174 @@ Tercer corte:
 - Activar enforced solo en canales oficiales o estables.
 - Mantener canales experimentales en advisory/shadow.
 - Agregar nuevos `ChannelSnapshot` adapters para canales adicionales.
+
+## Tests
+
+Sin tests no se puede confiar en que el motor se comporta correctamente bajo
+condiciones reales. El motor tiene multiples capas que interactuan — un error
+en cualquiera puede resultar en un envio no autorizado o un bloqueo incorrecto.
+
+### Que testear y por que
+
+No testear la IA. Testear que el motor la usa bien y que sobrevive cuando falla.
+
+```txt
+Policy Engine:
+  verifica que las reglas duras bloquean antes de llegar a la IA.
+  si esto falla, la IA puede recibir requests que no deberia.
+
+Schema Validator:
+  verifica que output invalido activa el fallback, no un error no manejado.
+  si esto falla, un modelo alucinando puede romper el flujo completo.
+
+Business Validator:
+  verifica que un "allow" de la IA puede convertirse en "block".
+  si esto falla, la IA tiene la ultima palabra — que es exactamente lo que
+  esta arquitectura promete evitar.
+
+ruleOnlyFallback:
+  verifica que cuando la IA no esta disponible, el sistema no se rompe.
+  si esto falla, una caida del proveedor de IA rompe toda la plataforma.
+
+Cost Estimator:
+  verifica que un fallo del estimador no bloquea el flujo.
+  verifica que retorna 0 (no lanza excepcion) cuando la rate card no existe.
+
+Cache:
+  verifica que dos requests identicas no llaman a la IA dos veces.
+  verifica que un cambio en el contexto (saldo, health score) invalida la cache.
+```
+
+### Casos minimos obligatorios
+
+Estos casos deben pasar antes de activar cualquier modo que no sea simulation:
+
+```txt
+Plan insuficiente
+  input:  plan = 'Free', modo = 'advisory'
+  expect: decision = block, reasonCode incluye PLAN_NOT_ALLOWED
+
+Canal desconectado
+  input:  channelStatus = 'disconnected'
+  expect: decision = block, reasonCode incluye CHANNEL_DISCONNECTED
+
+Saldo insuficiente
+  input:  estimatedCostARS = 5000, availableBalanceARS = 100
+  expect: decision = block, reasonCode incluye CHANNEL_BALANCE_INSUFFICIENT
+
+Opt-out total
+  input:  todos los destinations con optOut = true
+  expect: decision = block, reasonCode incluye OPT_OUT
+
+Opt-out parcial
+  input:  algunos destinations con optOut = true
+  expect: decision != block global, blockedDestinations incluye los opt-out
+
+Health score critico
+  input:  healthScore = 20
+  expect: decision = block o require_approval segun politica
+
+IA no disponible
+  input:  provider no responde (mock de timeout)
+  expect: decision via ruleOnlyFallback, fallbackUsed = true, no exception
+
+Schema invalido en primer intento, valido en segundo
+  input:  mock que devuelve JSON invalido la primera vez, valido la segunda
+  expect: decision valida, schemaAttempts = 2, tokens acumulados de ambas llamadas
+
+Schema invalido en ambos intentos
+  input:  mock que siempre devuelve JSON invalido
+  expect: decision via ruleOnlyFallback, evento schema_failed emitido
+
+IA devuelve allow, Business Validator lo convierte en block
+  input:  mock de IA devuelve allow, pero canal se desconecta entre llamada y validacion
+  expect: decision = block, businessValidationResult.passed = false
+
+Cache hit
+  input:  dos requests con mismo inputHash + contextHash
+  expect: segunda request no llama a la IA, cacheHit = true
+
+Cache invalidada por cambio de contexto
+  input:  primera request con healthScore = 80, segunda con healthScore = 20
+  expect: segunda request llama a la IA (contextHash diferente)
+
+Canal experimental en modo enforced
+  input:  channelType = 'experimental', mode = 'enforced'
+  expect: decision = block, sin importar lo que diga la IA
+
+Reserva de saldo falla en modo enforced
+  input:  channelBalanceService.requestReservation lanza error
+  expect: decision final = block, reasonCode incluye CHANNEL_BALANCE_INSUFFICIENT
+
+Decision expirada
+  input:  RouterDecision con expiresAt en el pasado
+  expect: executor rechaza la decision, no ejecuta
+```
+
+### Estructura sugerida
+
+```txt
+tests/
+  unit/
+    routerDecision.schema.test      <- valida y rechaza outputs de IA
+    ruleOnlyFallback.test           <- cubre los 4 casos de riesgo
+    businessValidator.test          <- "allow" de IA convertido en "block"
+    costEstimator.test              <- fallo de rate card, conversion, override
+  integration/
+    policyEngine.routing.test       <- cada politica bloquea lo que debe
+    routingDecision.service.test    <- flujo completo con mocks de IA y DB
+    cache.invalidation.test         <- hit, miss, invalidacion por contexto
+  e2e/
+    simulate.endpoint.test          <- POST /routing/simulate responde correctamente
+    advisory.endpoint.test          <- POST /routing/advisory genera ApprovalRequest
+```
+
+### Como mockear la IA en tests
+
+No llamar al proveedor real en tests. Mockear `_callAI` para controlar exactamente
+que devuelve:
+
+```js
+// mock que devuelve output valido
+jest.spyOn(routingDecision, '_callAI').mockResolvedValue({
+  content: JSON.stringify(validOutput),
+  tokensInput: 120,
+  tokensOutput: 80,
+});
+
+// mock que simula timeout
+jest.spyOn(routingDecision, '_callAI').mockRejectedValue(
+  new Error('Request timeout')
+);
+
+// mock que devuelve schema invalido
+jest.spyOn(routingDecision, '_callAI').mockResolvedValue({
+  content: '{"decision": "maybe"}',
+  tokensInput: 50,
+  tokensOutput: 10,
+});
+```
+
+### Que NO testear
+
+```txt
+que el modelo de IA toma la decision correcta
+  -> eso es evaluacion del modelo, no test de integracion
+
+que la rate card tiene los precios correctos
+  -> eso es un test de datos, no de logica
+
+que el proveedor de IA esta disponible
+  -> eso es monitoreo, no test
+```
+
+### Regla de oro
+
+```txt
+si un test requiere que la IA responda correctamente para pasar,
+no es un test del motor — es un test del modelo.
+el motor debe funcionar correctamente sin importar lo que diga la IA.
+```
 
 ## Conclusiones
 
