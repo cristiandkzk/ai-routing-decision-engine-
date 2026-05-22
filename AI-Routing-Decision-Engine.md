@@ -1460,8 +1460,8 @@ Beneficios:
 Regla final:
 
 ```txt
-Rules decide what is allowed.
-AI optimizes what is allowed.
-Validators decide what can be executed.
-Executors only run validated decisions.
+Las reglas deciden qué está permitido.
+La IA optimiza lo que está permitido.
+Los validadores deciden qué puede ejecutarse.
+Los ejecutores solo ejecutan decisiones validadas..
 ```
