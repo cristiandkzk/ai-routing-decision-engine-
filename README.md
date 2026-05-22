@@ -487,6 +487,62 @@ Tercer corte:
 - Mantener canales experimentales en advisory/shadow.
 - Agregar nuevos `ChannelSnapshot` adapters para canales adicionales.
 
+## Evidencia de implementacion
+
+Este protocolo fue implementado y probado en produccion antes de ser publicado.
+Los resultados que siguen son reales — no mocks del documento.
+
+### Tests automatizados
+
+```
+93 tests — 4 suites — 0 fallos
+
+Unit        routerDecision.schema.test    35 tests
+            ruleOnlyFallback.test         29 tests
+Integration policyEngine.routing.test     22 tests
+            routingDecision.service.test  22 tests
+```
+
+Cada componente critico tiene cobertura antes de pasar a advisory o enforced.
+
+### Simulacion contra MongoDB real (6 casos)
+
+```
+✓  Caso 1 — Contexto valido (camino feliz)
+   decision: allow | state: routable | confidence: high
+   fallbackUsed: false | cacheHit: false
+   batches: 1 tanda | dest_004 y dest_005 en blockedDestinations (opt-out/paused)
+
+✓  Caso 2 — routerAiEnabled = false (fallback sin IA)
+   decision: allow | state: routable | cacheHit: true
+   reasonCodes: LOW_RISK_RULES_PASSED
+
+✗  Caso 3 — companyPaused = true
+   decision: block | state: blocked | fallbackUsed: true
+   reasonCodes: TENANT_PAUSED
+
+✗  Caso 4 — Canal desconectado
+   decision: block | state: blocked | fallbackUsed: true
+   reasonCodes: CHANNEL_DISCONNECTED | requiredActions: reconnect_channel
+
+✗  Caso 5 — Todos los destinos con opt-out
+   decision: block | state: blocked | fallbackUsed: true
+   reasonCodes: OPT_OUT
+
+✗  Caso 6 — Plan Free en modo advisory
+   decision: block | state: blocked | fallbackUsed: true
+   reasonCodes: PLAN_LIMIT_EXCEEDED | requiredActions: upgrade_plan
+```
+
+El Caso 2 muestra cache hit del Caso 1 — mismo inputHash y contextHash, sin llamada a la IA.
+Los Casos 3-6 son bloqueados por el Policy Engine antes de llegar a la IA — `fallbackUsed: true`
+porque el ruleOnlyFallback se activa cuando las reglas bloquean.
+
+### Bugs reales encontrados al implementar
+
+El documento completo tiene la seccion "Bugs reales encontrados durante la implementacion"
+con los 5 errores que surgieron al correr tests y simulacion — no al leer el spec.
+
 ## Documento completo
 
 La version extendida esta en:

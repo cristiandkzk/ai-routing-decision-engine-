@@ -771,16 +771,20 @@ El provider selector elige el modelo segun costo, riesgo y plan del tenant.
 ```txt
 plan Base:
   modelo cheap o balanced para decisiones simples y riesgo bajo/medio
-  ejemplo: Groq openai/gpt-oss-20b
+  ejemplo: Groq llama-3.3-70b-versatile
 
 plan Pro/Premium:
   modelo best para riesgo complejo y alto volumen
-  ejemplo: Groq openai/gpt-oss-120b
+  ejemplo: Groq meta-llama/llama-4-scout-17b-16e-instruct
 
 fallback universal:
   OpenRouter con modelo compatible con structured outputs
   activar cuando el primario falla o el circuito esta abierto
 ```
+
+Verificar siempre los nombres de modelos contra la API real del proveedor antes
+de agregarlos al registry. Los nombres de documentacion de marketing no siempre
+coinciden con los IDs reales de la API.
 
 Reglas para el provider selector:
 
@@ -1326,6 +1330,117 @@ si un test requiere que la IA responda correctamente para pasar,
 no es un test del motor — es un test del modelo.
 el motor debe funcionar correctamente sin importar lo que diga la IA.
 ```
+
+## Bugs reales encontrados durante la implementacion
+
+Estos errores surgieron al correr los tests y la simulacion contra MongoDB.
+No al leer el spec — al ejecutarlo.
+
+Se documentan porque los mismos problemas van a aparecer en cualquier
+implementacion de este patron.
+
+### 1. isIso aceptaba strings no-ISO
+
+**Symptoma:** el test `routerDecision.schema` pasaba con `expiresAt: 'manana a las 3'`.
+
+**Causa:** `Date.parse()` de V8 acepta strings que no son ISO 8601 y devuelve
+un timestamp valido en lugar de `NaN`. El validador confiaba solo en `Date.parse()`.
+
+**Fix:**
+
+```js
+const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/;
+function isIso(v) {
+  return isString(v) && ISO_RE.test(v) && !Number.isNaN(Date.parse(v));
+}
+```
+
+Regla: no usar `Date.parse()` solo para validar formato ISO. Agregar regex primero.
+
+### 2. Policy Engine no bloqueaba en tests de integracion
+
+**Symptoma:** 14 de 22 tests fallaban con `Expected: false, Received: true`.
+Las politicas devolvian `allowed: true` para todos los inputs.
+
+**Causa:** el test hacia `require('policy.engine')` directo pero nunca llamaba
+`registerAll()`. Sin esa llamada el engine tiene 0 politicas registradas y
+devuelve `allowed: true` por defecto.
+
+**Fix:** agregar en el `beforeAll` del test:
+
+```js
+const { registerAll } = require('../../src/modules/policy/policies');
+beforeAll(() => { registerAll(); });
+```
+
+Regla: si el engine usa un registro lazy, el test debe activarlo explicitamente.
+No asumir que `require` del engine es suficiente.
+
+### 3. Modelos Groq que no existen
+
+**Symptoma:** `400 json_validate_failed` al llamar al proveedor en la simulacion.
+
+**Causa:** el registry del Provider Selector tenia `openai/gpt-oss-20b` y
+`openai/gpt-oss-120b` como modelos de Groq — nombres de una lista de marketing
+que no corresponden a modelos reales disponibles en la API.
+
+**Fix:** reemplazar por modelos verificados contra `groq.models.list()`:
+
+```txt
+llama-3.3-70b-versatile          <- decision engine, riesgo bajo/medio
+meta-llama/llama-4-scout-17b-16e-instruct  <- riesgo alto, mayor capacidad
+```
+
+Regla: verificar modelos contra la API real antes de agregarlos al registry.
+No copiar nombres de documentacion de marketing.
+
+### 4. La IA genera expiresAt en el pasado
+
+**Symptoma:** `decision: allow` pero `state: blocked` en el Business Validator.
+El campo `businessValidationResult.failures` mostraba `DECISION_EXPIRED`.
+
+**Causa:** el modelo genero `expiresAt: "2024-09-17T14:30:00.000Z"` — una fecha
+de su training cutoff, no del momento de la llamada. El Business Validator
+bloqueaba correctamente porque la fecha ya habia pasado.
+
+**Fix en dos partes:**
+
+Parte 1 — normalizar post-schema si la fecha ya paso:
+
+```js
+if (validatedOutput.expiresAt && new Date(validatedOutput.expiresAt) < new Date()) {
+  validatedOutput = { ...validatedOutput, expiresAt: new Date(Date.now() + DECISION_TTL_MS) };
+}
+```
+
+Parte 2 — informarle al modelo la fecha actual en el system prompt:
+
+```js
+`La fecha y hora actual es: ${new Date().toISOString()}`
+```
+
+Regla: la IA no conoce el tiempo real. Cualquier campo de fecha que dependa
+del momento de la llamada debe ser normalizado server-side. No confiar en que
+el modelo lo calcule correctamente.
+
+### 5. tenantId como ObjectId en los eventos del outbox
+
+**Symptoma:** warning `tenantId: expected string, got object` en el event
+contract validator.
+
+**Causa:** `snapshot.clientId` es un `mongoose.Types.ObjectId`. El event
+contract esperaba un string. El contrato fue disenado pensando en strings,
+pero el modelo lo persiste como ObjectId.
+
+**Fix:**
+
+```js
+tenantId: String(snapshot.clientId),
+```
+
+Regla: en la frontera entre Mongoose y sistemas de eventos (outbox, queues,
+webhooks), convertir siempre ObjectId a string explicitamente. No asumir que
+la serializacion implicita lo hace.
 
 ## Conclusiones
 
