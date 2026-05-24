@@ -1,5 +1,10 @@
 # AI Routing Decision Engine
 
+> Parte de [Safe Automation Control Plane](https://github.com/cristiandkzk/Safe-Automation-Control-Plane).
+> Este componente se encarga de decidir y validar acciones. Puede combinarse con
+> [Provider Outbound Gateway](https://github.com/cristiandkzk/Provider-Outbound-Gateway)
+> para ejecutar llamadas externas de forma segura.
+
 Arquitectura **rule-first** para tomar decisiones con IA de forma segura,
 auditable y con control de costos.
 
