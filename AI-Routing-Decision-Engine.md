@@ -76,20 +76,39 @@ Nunca:
 AI Router -> Executor directo
 ```
 
-## Arquitectura multicanal
+## Arquitectura multicanal y multi-accion
 
-El Decision Engine debe ser canal-agnostico en su core.
+El Decision Engine debe ser canal-agnostico y accion-agnostica en su core.
+
+El input universal es un `RoutingSnapshot` con un sub-objeto `action` que
+identifica que tipo de decision se pide:
 
 ```txt
-campaignRouting.service
-  -> detecta canal de la campaña
-  -> instancia ChannelSnapshot adapter correcto
-  -> construye snapshot universal (CampaignRoutingSnapshot)
+action.type:
+  campaign_send      — envio masivo de campaña
+  inbound_reply      — respuesta a un mensaje o evento entrante
+  content_publish    — publicar producto o post en canal externo
+  auto_reply         — respuesta automatica del bot
+  comment_moderate   — moderar o responder comentario publico
+```
+
+El `action.type` determina:
+- el scope de policy a evaluar (cada tipo puede tener reglas duras propias);
+- el feature que usa el provider selector (distintos modelos por tipo);
+- los titulos de ApprovalRequest;
+- que pasos del flujo aplican (ej: reserva de saldo solo en campaign_send).
+
+```txt
+adaptador de dominio (campaignRouting.service, instagramEvent.service, etc.)
+  -> detecta canal y tipo de accion
+  -> instancia el ChannelSnapshot adapter correcto
+  -> construye RoutingSnapshot con action.type declarado
   -> llama routingDecision.service
 
 routingDecision.service
-  -> siempre recibe el mismo contrato universal
-  -> no sabe ni le importa si el canal es Meta, Instagram, Telegram, etc.
+  -> siempre recibe el mismo contrato universal (RoutingSnapshot)
+  -> no sabe ni le importa si el canal es Meta, Instagram, Baileys, etc.
+  -> elige el scope de policy y el feature del selector segun action.type
 ```
 
 Para agregar un canal nuevo:
@@ -98,7 +117,15 @@ Para agregar un canal nuevo:
 agregar {Canal}ChannelSnapshot.js     <- traduce estado del canal al snapshot universal
 agregar {canal}CostEstimator.service  <- estima costo especifico del canal
 agregar {canal}Balance.service        <- reserva saldo si el canal lo requiere
-agregar politicas especificas del canal si las necesita
+agregar politicas especificas del canal o accion si las necesita
+```
+
+Para agregar un tipo de accion nuevo:
+
+```txt
+agregar scope de policy 'router_ai.{tipo}'  <- reglas duras para ese tipo
+agregar feature en providerSelector          <- que modelos pueden responder
+agregar factory en RoutingSnapshot           <- RoutingSnapshot.for{Tipo}(p)
 ```
 
 No cambiar:
@@ -255,13 +282,16 @@ src/
       ruleOnlyFallback.service
       businessValidator.service
   routing/
-    campaignRouting.service          <- orquestador, canal-agnostico
-    CampaignRoutingSnapshot          <- builder del snapshot universal
+    RoutingSnapshot                  <- contrato universal con action.type
     adapters/
-      MetaChannelSnapshot            <- canal Meta
-      InstagramChannelSnapshot       <- futuro
-      MercadoLibreChannelSnapshot    <- futuro
-      TelegramChannelSnapshot        <- futuro
+      MetaChannelSnapshot            <- canal Meta -> snapshot
+      InstagramChannelSnapshot       <- canal Instagram -> snapshot
+      MercadoLibreChannelSnapshot    <- canal ML -> snapshot
+      InstagramEventSnapshot         <- evento inbound -> RoutingSnapshot completo
+  campaigns/
+    routing/
+      CampaignRoutingSnapshot        <- wrapper de RoutingSnapshot para campaign_send
+      campaignRouting.service        <- orquestador de campanas
   policy/
     policy.engine
     policies/
@@ -273,6 +303,12 @@ src/
         planLimits.policy
         riskGates.policy
         experimentalChannel.policy   <- para canales experimentales
+      ← scopes por action.type:
+          router_ai.routing          (campaign_send)
+          router_ai.inbound_reply    (DM, mensaje entrante)
+          router_ai.comment_moderate (comentario publico)
+          router_ai.auto_reply       (automatizacion)
+          router_ai.content_publish  (publicacion en canal externo)
   approvals/
     approval.service
   costs/
@@ -415,8 +451,12 @@ Pseudocodigo:
 ```js
 async function decide(snapshot, opts) {
   const hashes = hashSnapshot(snapshot);
+  const actionType = snapshot.action?.type || 'campaign_send';
 
-  const policy = await policyEngine.evaluate('router_ai.routing', snapshot);
+  // El scope de policy varia por action.type.
+  // Si el scope no tiene politicas registradas, el engine retorna allowed:true.
+  const policyScope = `router_ai.${actionType}`;
+  const policy = await policyEngine.evaluate(policyScope, snapshot);
   if (!policy.allowed) {
     return persist(ruleOnlyBlocked({ snapshot, policy, hashes }));
   }
@@ -426,8 +466,11 @@ async function decide(snapshot, opts) {
     return validateAndPersistCacheHit(cached, snapshot);
   }
 
+  // El feature del selector varia por action.type para permitir
+  // distintos modelos segun el tipo de decision.
+  const selectorFeature = `decision_engine_${actionType}`;
   const provider = await providerSelector.select({
-    feature: 'router_ai',
+    feature: selectorFeature,
     riskLevel: snapshot.risk.riskLevel,
     estimatedTokensInput: snapshot.estimatedTokensInput,
     estimatedTokensOutput: snapshot.estimatedTokensOutput,
@@ -479,22 +522,26 @@ Responsabilidad:
 ```txt
 detectar canal de la campaña
 instanciar el ChannelSnapshot adapter correcto
-construir CampaignRoutingSnapshot universal
+construir RoutingSnapshot con action.type = 'campaign_send'
 estimar costos
 llamar routingDecision.service
 devolver resultado para UI/API
 ```
 
-Snapshot universal recomendado (CampaignRoutingSnapshot):
+`CampaignRoutingSnapshot` puede existir como wrapper o factory de `RoutingSnapshot`
+para este caso especifico. El motor siempre recibe `RoutingSnapshot`.
+
+Snapshot universal recomendado (RoutingSnapshot para campaign_send):
 
 ```txt
-campaignId
+clientId
+sourceId               <- id de la entidad origen (campaignId, eventId, etc.)
 correlationId / causationId
 schemaVersion
 mode
 plan
-campaignType
-campaign               <- state, requiresBalanceReservation, safeHoursRequired
+action                 <- { type, sourceModule, sourceType, sourceRef }
+campaign               <- state, requiresBalanceReservation, safeHoursRequired (solo en campaign_send)
 message                <- fingerprint, hasLink, mediaCount (sin text crudo)
 destinations[]         <- resumen: id, type, riskScore, optOut, pauseState
 channel                <- objeto universal (ver abajo)
@@ -760,7 +807,7 @@ targets (filtrados: sin opt-out ni pausados)
   -> arsRate = getExchangeRate() con fallback a .env
   -> estimatedCostARS = ceil(totalUSD * arsRate)
   -> ChannelSnapshot.build({ estimatedCostARS, ... })
-  -> CampaignRoutingSnapshot.channel.estimatedCostARS
+  -> RoutingSnapshot.channel.estimatedCostARS
   -> routingDecision.service lo pasa a la IA y al Business Validator
 ```
 
@@ -1020,9 +1067,11 @@ ApprovalRequest
   solicitud de aprobacion humana generada cuando requiresApproval = true.
   sin esto el flujo de advisory no tiene donde persistir la aprobacion.
 
-CampaignRoutingSnapshot (o equivalente por dominio)
-  el contrato de entrada al motor. define exactamente que datos recibe la IA.
-  sin un contrato fijo, el motor no es canal-agnostico.
+RoutingSnapshot (con action.type)
+  el contrato universal de entrada al motor. define exactamente que datos recibe la IA.
+  el campo action.type permite que el motor sea canal-agnostico y accion-agnostica.
+  CampaignRoutingSnapshot puede existir como wrapper para campaign_send — pero
+  el contrato canonico que recibe routingDecision.service es RoutingSnapshot.
 
 RouterDecision.schema (JSON Schema del output de IA)
   define exactamente que debe devolver el modelo.
@@ -1116,8 +1165,8 @@ multiples ChannelSnapshot adapters
 5. ChannelSnapshot adapter del canal oficial
    traduce el estado del canal al contrato universal.
 
-6. campaignRouting.service (o equivalente por dominio)
-   conecta el dominio con el motor.
+6. adaptador de dominio (campaignRouting.service o equivalente)
+   construye el RoutingSnapshot con action.type y conecta el dominio con el motor.
 
 7. Endpoint de simulacion
    primer punto de entrada para validar el flujo completo.
@@ -1136,9 +1185,9 @@ Primer corte:
 - Crear `ruleOnlyFallback.service`.
 - Crear `routingDecision.service`.
 - Crear adaptador por dominio, por ejemplo `campaignRouting.service`.
-- Crear `CampaignRoutingSnapshot` con contrato universal.
+- Crear `RoutingSnapshot` con contrato universal y `action.type`.
 - Crear primer `ChannelSnapshot` adapter para el canal oficial.
-- Integrar Policy Engine con scope `router_ai.routing`.
+- Integrar Policy Engine con scope por `action.type` (minimo: `router_ai.routing` para `campaign_send`).
 - Integrar decision cache.
 - Integrar provider selector con seleccion por plan.
 - Integrar usage ledger.
