@@ -76,6 +76,176 @@ Nunca:
 AI Router -> Executor directo
 ```
 
+## El motor es escalable en la toma de decisiones
+
+El motor no es solo para campañas o mensajeria. Es un patron de decision que
+aplica a cualquier accion con costo, riesgo o impacto operativo — sin importar
+quien la origina.
+
+### Quien puede originar una decision
+
+```txt
+Usuario via UI del panel
+  -> crea campaña, publica producto, registra gasto
+
+Bot o automatizacion
+  -> responde un mensaje entrante, envia un auto-reply programado
+
+Asistente IA interno (agente de panel)
+  -> el usuario pide algo en lenguaje natural
+  -> el agente propone la accion
+  -> el motor valida y decide
+  -> el humano aprueba si el riesgo lo exige
+  -> el executor ejecuta
+
+Worker o job programado
+  -> sync de stock, reconciliacion de ordenes
+
+Webhook de proveedor externo
+  -> llega una pregunta de marketplace, un evento de orden, un mensaje inbound
+```
+
+Todos estos origenes producen el mismo resultado: un `RoutingSnapshot` con
+`action.type` declarado. El motor no sabe ni le importa quien armo el snapshot.
+
+### El patron del asistente IA interno
+
+Un asistente interno (chatbot de panel, agente conversacional) es uno de los
+origenes mas comunes en plataformas SaaS. El patron correcto:
+
+```txt
+Asistente recibe pedido del usuario en lenguaje natural
+  -> Asistente consulta datos necesarios (tools de lectura)
+  -> Asistente propone accion (tool propose_*)
+  -> tool propose_* arma RoutingSnapshot con action.type correcto
+  -> llama routingDecision.service
+  -> routingDecision.service ejecuta el flujo completo:
+       Policy Engine -> AI Router -> Schema Validator
+       -> Business Validator -> ApprovalRequest si corresponde
+  -> tool devuelve { status: 'pending_approval' | 'allowed' | 'blocked' }
+  -> Asistente comunica el resultado al usuario
+```
+
+Lo que el asistente NO hace:
+
+```txt
+ejecutar la accion directamente
+llamar APIs externas directamente
+bypassear el Policy Engine
+asumir que su propia evaluacion de riesgo es suficiente
+aprobar sus propias propuestas
+```
+
+El asistente propone. El motor decide. El humano aprueba si corresponde.
+El executor ejecuta.
+
+### Separacion de tools en el asistente
+
+Las tools del asistente deben separarse en dos categorias:
+
+```txt
+tools de lectura (read_*):
+  -> consultan datos internos directamente
+  -> sin Policy Engine, sin Router AI
+  -> ejemplos: list_contacts, get_account_info, list_marketplace_questions
+
+tools de propuesta (propose_*):
+  -> arman un RoutingSnapshot y llaman routingDecision.service
+  -> el resultado es una RouterDecision con su estado
+  -> el asistente comunica ese estado, no lo evalua
+  -> ejemplos: propose_marketplace_answer, propose_publish_product, propose_finance_expense
+```
+
+Esta separacion garantiza que las tools de lectura sean baratas y rapidas,
+y que las tools de accion pasen siempre por el motor de decisiones.
+
+### Mapeo de acciones del asistente a action.type
+
+El asistente no necesita saber que scope de policy aplica. Solo declara
+`action.type` y el motor enruta al scope correcto.
+
+```txt
+responder pregunta de marketplace  -> action.type = 'inbound_reply'
+                                      sourceModule = 'marketplace'
+                                      sourceType   = 'marketplace_answer_question'
+
+publicar producto en marketplace   -> action.type = 'content_publish'
+                                      sourceModule = 'marketplace'
+                                      sourceType   = 'marketplace_publish_product'
+
+enviar campaña de marketing        -> action.type = 'campaign_send'
+                                      sourceModule = 'campaigns'
+
+responder comentario publico       -> action.type = 'comment_moderate'
+                                      sourceModule = 'social'
+
+registrar gasto en finanzas        -> action.type = 'inbound_reply'
+                                      sourceModule = 'finance'
+                                      sourceType   = 'finance_expense_create'
+```
+
+`sourceModule` y `sourceType` son metadata de trazabilidad y auditoria —
+identifican el origen exacto dentro del sistema sin afectar el flujo del motor.
+
+### Como se extiende a nuevos dominios
+
+Agregar soporte para un nuevo dominio (marketplace, finanzas, RRHH, logistica)
+no requiere cambiar el motor. Solo requiere:
+
+```txt
+1. ContextBuilder del dominio
+   -> arma el RoutingSnapshot con action.type y sourceModule correctos
+   -> incluye el contexto relevante del dominio en el snapshot
+
+2. PolicyScope del dominio (si necesita reglas propias)
+   -> si las reglas del action.type existente alcanzan, no hace falta
+   -> ejemplo: 'router_ai.inbound_reply' puede cubrir respuestas de marketplace
+      si las politicas son las mismas
+
+3. Tool propose_* en el asistente
+   -> llama al ContextBuilder y a routingDecision.service
+   -> devuelve el estado de la RouterDecision al asistente
+```
+
+No cambiar:
+
+```txt
+routingDecision.service
+RouterDecision.model
+routerDecision.schema
+ruleOnlyFallback.service
+Policy Engine
+AI Decision Cache
+Provider Selector
+```
+
+### Flujo completo con asistente interno
+
+```txt
+1. Usuario al asistente: "respondele a pepe123 que si tenemos talle 43"
+2. Asistente llama read_marketplace_question({ id: '...' })
+3. Asistente llama propose_marketplace_answer({ conversationId, answerText })
+4. propose_marketplace_answer:
+     a. arma RoutingSnapshot.forInboundReply({
+          sourceModule: 'marketplace',
+          sourceType:   'marketplace_answer_question',
+          ...contexto del marketplace
+        })
+     b. llama routingDecision.service.decide(snapshot)
+     c. Policy Engine evalua 'router_ai.inbound_reply'
+     d. Business Validator exige approval en MVP
+     e. Se crea ApprovalRequest con status 'pending'
+5. Tool devuelve { status: 'pending_approval', approvalId: 'apr_xxx', decisionId: 'rdec_yyy' }
+6. Asistente: "La respuesta quedo pendiente de aprobacion (apr_xxx).
+              Podés aprobarla desde el panel o por WhatsApp si lo tenes configurado."
+7. Usuario aprueba desde el panel
+8. Executor recibe la decision approved y ejecuta via Provider Outbound Gateway
+```
+
+El asistente nunca sabe si hubo approval o no en el paso 4. Solo recibe el
+estado resultante de la RouterDecision y lo comunica. La logica de approval
+vive en el Business Validator, no en el asistente.
+
 ## Arquitectura multicanal y multi-accion
 
 El Decision Engine debe ser canal-agnostico y accion-agnostica en su core.
@@ -87,9 +257,35 @@ identifica que tipo de decision se pide:
 action.type:
   campaign_send      — envio masivo de campaña
   inbound_reply      — respuesta a un mensaje o evento entrante
+                       (cubre: DMs, preguntas de marketplace, mensajes de marketplace,
+                        respuestas de soporte, propuestas de asistente interno)
   content_publish    — publicar producto o post en canal externo
+                       (cubre: publicaciones de marketplace, posts en redes)
   auto_reply         — respuesta automatica del bot
   comment_moderate   — moderar o responder comentario publico
+```
+
+`action.sourceModule` y `action.sourceType` son metadata de trazabilidad:
+
+```txt
+sourceModule:
+  campaigns     — flujo de campañas
+  marketplace   — MercadoLibre, eBay, Shopify, etc.
+  social        — Instagram, Facebook, etc.
+  crm           — respuestas desde el CRM
+  finance       — gastos, ingresos
+  assistant     — propuestas originadas desde el asistente interno
+
+sourceType:
+  ejemplos para marketplace:
+    marketplace_answer_question
+    marketplace_answer_message
+    marketplace_publish_product
+    marketplace_update_listing
+    marketplace_sync_stock
+  ejemplos para finanzas:
+    finance_expense_create
+    finance_income_record
 ```
 
 El `action.type` determina:
@@ -97,6 +293,9 @@ El `action.type` determina:
 - el feature que usa el provider selector (distintos modelos por tipo);
 - los titulos de ApprovalRequest;
 - que pasos del flujo aplican (ej: reserva de saldo solo en campaign_send).
+
+`sourceModule` y `sourceType` solo afectan trazabilidad y auditoria —
+no cambian el flujo del motor.
 
 ```txt
 adaptador de dominio (campaignRouting.service, instagramEvent.service, etc.)
@@ -292,6 +491,14 @@ src/
     routing/
       CampaignRoutingSnapshot        <- wrapper de RoutingSnapshot para campaign_send
       campaignRouting.service        <- orquestador de campanas
+  marketplace/
+    context/
+      marketplaceContext.builder     <- arma RoutingSnapshot desde eventos de marketplace
+  assistant/
+    tools/
+      propose_marketplace_answer     <- tool del asistente, llama routingDecision.service
+      propose_marketplace_publish    <- idem para publicaciones
+      propose_finance_expense        <- idem para finanzas
   policy/
     policy.engine
     policies/
@@ -978,10 +1185,13 @@ RouterDecision para garantizar consistencia en reintentos.
 routerAiEnabled
 routerAiForCampaignsEnabled
 routerAiForMetaEnabled
-routerAiForInstagramEnabled      <- futuro
-routerAiForMercadoLibreEnabled   <- futuro
-routerAiForTelegramEnabled       <- futuro
-routerAiForBaileysEnabled        <- siempre advisory/shadow, nunca enforced
+routerAiForInstagramEnabled        <- futuro
+routerAiForMercadoLibreEnabled     <- futuro
+routerAiForEbayEnabled             <- futuro
+routerAiForTelegramEnabled         <- futuro
+routerAiForBaileysEnabled          <- siempre advisory/shadow, nunca enforced
+routerAiForMarketplaceEnabled      <- flag umbrella para todos los marketplaces
+routerAiForAssistantProposalsEnabled  <- habilita propose_* desde asistente interno
 tenantRouterAiEnabled
 forceRuleOnlyForTenant
 ```
@@ -1504,7 +1714,9 @@ Beneficios:
 - rollback mas simple;
 - mejor explicacion para el usuario;
 - base solida para aprobaciones y compliance;
-- nuevos canales sin tocar el core.
+- nuevos canales sin tocar el core;
+- nuevos dominios (marketplace, finanzas, social) sin tocar el motor;
+- asistentes internos que proponen sin ejecutar directamente.
 
 Regla final:
 
@@ -1512,5 +1724,9 @@ Regla final:
 Las reglas deciden qué está permitido.
 La IA optimiza lo que está permitido.
 Los validadores deciden qué puede ejecutarse.
-Los ejecutores solo ejecutan decisiones validadas..
+Los ejecutores solo ejecutan decisiones validadas.
+
+Quien origina la decision no importa:
+  un usuario, un bot, un asistente IA o un worker
+  siempre pasan por el mismo motor.
 ```

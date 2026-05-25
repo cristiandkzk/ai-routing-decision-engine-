@@ -76,35 +76,58 @@ flowchart TD
     style K fill:#22c55e,color:#fff
 ```
 
-## Arquitectura multicanal
+## Escalable en origenes, canales y dominios
+
+El motor recibe siempre el mismo contrato: un `RoutingSnapshot` con `action.type`
+declarado. No importa quien lo origina ni que canal usa.
 
 ```mermaid
 flowchart LR
-    SVC[campaignRouting.service\norquestador] --> SNAP[CampaignRoutingSnapshot\ncontrato universal]
+    subgraph Origenes
+        O1[UI del panel]
+        O2[Bot / automatizacion]
+        O3[Asistente IA interno\npropone via propose_*]
+        O4[Worker / job]
+        O5[Webhook entrante]
+    end
+
+    subgraph ContextBuilders
+        CB1[campaignRouting.service]
+        CB2[instagramEvent.service]
+        CB3[marketplaceContext.builder]
+        CB4[assistantProposal.builder]
+    end
 
     subgraph Adapters
         A1[MetaChannelSnapshot]
         A2[InstagramChannelSnapshot]
         A3[MercadoLibreChannelSnapshot]
-        A4[TelegramChannelSnapshot]
+        A4[EbayChannelSnapshot]
     end
 
-    SVC --> A1
-    SVC --> A2
-    SVC --> A3
-    SVC --> A4
+    O1 & O2 --> CB1
+    O5 --> CB2
+    O5 --> CB3
+    O3 & O4 --> CB4
 
-    A1 & A2 & A3 & A4 --> SNAP
+    CB1 --> A1
+    CB2 --> A2
+    CB3 --> A3
+    CB4 --> A4
 
-    SNAP --> CORE[routingDecision.service\ncanal-agnostico]
+    A1 & A2 & A3 & A4 --> SNAP[RoutingSnapshot\naction.type declarado]
+
+    SNAP --> CORE[routingDecision.service\ncanal-agnostico\naccion-agnostica]
 
     CORE --> RD[(RouterDecision)]
 
     style CORE fill:#6366f1,color:#fff
     style SNAP fill:#0ea5e9,color:#fff
+    style O3 fill:#8b5cf6,color:#fff
 ```
 
-> Para agregar un canal nuevo: crear el adapter correspondiente. El core no cambia.
+> Para agregar un canal nuevo: crear el adapter. Para agregar un dominio nuevo:
+> crear el context builder. El core no cambia.
 
 ## Por que existe
 
@@ -288,13 +311,24 @@ src/
       ruleOnlyFallback.service
       businessValidator.service
   routing/
-    campaignRouting.service          <- orquestador, canal-agnostico
-    CampaignRoutingSnapshot          <- contrato universal
+    RoutingSnapshot                  <- contrato universal con action.type
     adapters/
-      MetaChannelSnapshot            <- primer canal oficial
-      InstagramChannelSnapshot       <- futuro
-      MercadoLibreChannelSnapshot    <- futuro
-      TelegramChannelSnapshot        <- futuro
+      MetaChannelSnapshot            <- canal Meta -> snapshot
+      InstagramChannelSnapshot       <- canal Instagram -> snapshot
+      MercadoLibreChannelSnapshot    <- canal ML -> snapshot
+      EbayChannelSnapshot            <- canal eBay -> snapshot
+  campaigns/
+    routing/
+      CampaignRoutingSnapshot        <- wrapper de RoutingSnapshot para campaign_send
+      campaignRouting.service        <- context builder para campañas
+  marketplace/
+    context/
+      marketplaceContext.builder     <- context builder para eventos de marketplace
+  assistant/
+    tools/
+      propose_marketplace_answer     <- tool del asistente, llama routingDecision.service
+      propose_marketplace_publish
+      propose_finance_expense
   policy/
     policy.engine
     policies/
@@ -305,6 +339,12 @@ src/
         planLimits.policy
         riskGates.policy
         experimentalChannel.policy
+      <- scopes por action.type:
+          router_ai.routing          (campaign_send)
+          router_ai.inbound_reply    (DMs, marketplace, asistente)
+          router_ai.content_publish  (publicaciones externas)
+          router_ai.comment_moderate (comentarios publicos)
+          router_ai.auto_reply       (automatizaciones)
   approvals/
     approval.service
   costs/
@@ -469,6 +509,65 @@ Antes de implementar el motor estas estructuras deben existir:
 Ver la seccion "Estructuras necesarias para implementar" en el
 [documento completo](./AI-Routing-Decision-Engine.md) para el orden
 de construccion recomendado y lo que puede dejarse para despues.
+
+## El patron del asistente IA interno
+
+Un asistente conversacional (chatbot de panel, agente interno) es uno de los
+origenes mas comunes en plataformas SaaS. El motor lo soporta sin cambios.
+
+El patron correcto:
+
+```txt
+Asistente recibe pedido del usuario en lenguaje natural
+  -> Asistente consulta datos (tools de lectura, sin pasar por el motor)
+  -> Asistente propone accion via tool propose_*
+  -> propose_* arma RoutingSnapshot con action.type correcto
+  -> llama routingDecision.service
+  -> el motor ejecuta el flujo completo:
+       Policy Engine -> AI Router -> Schema Validator
+       -> Business Validator -> ApprovalRequest si corresponde
+  -> propose_* devuelve { status: 'pending_approval' | 'allowed' | 'blocked' }
+  -> Asistente comunica el resultado al usuario
+```
+
+Lo que el asistente NO hace:
+
+```txt
+ejecutar la accion directamente
+llamar APIs externas
+bypassear el Policy Engine
+aprobar sus propias propuestas
+```
+
+Las tools del asistente se separan en dos categorias:
+
+```txt
+read_*    -> consultan datos internos directamente, sin el motor
+propose_* -> arman un RoutingSnapshot y llaman routingDecision.service
+```
+
+Mapeo de acciones del asistente a action.type:
+
+```txt
+responder pregunta de marketplace  -> action.type = 'inbound_reply'
+                                      sourceModule = 'marketplace'
+                                      sourceType   = 'marketplace_answer_question'
+
+publicar producto en marketplace   -> action.type = 'content_publish'
+                                      sourceModule = 'marketplace'
+                                      sourceType   = 'marketplace_publish_product'
+
+registrar gasto en finanzas        -> action.type = 'inbound_reply'
+                                      sourceModule = 'finance'
+                                      sourceType   = 'finance_expense_create'
+```
+
+`sourceModule` y `sourceType` son metadata de trazabilidad y auditoria.
+No cambian el flujo del motor — solo identifican el origen exacto en los logs
+y en `RouterDecision`.
+
+Agregar soporte para un nuevo dominio (marketplace, finanzas, RRHH) requiere
+solo un context builder y una tool `propose_*`. El motor no cambia.
 
 ## Checklist de implementacion
 
